@@ -23,6 +23,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_log.h"
 #include "soc/soc_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -57,6 +58,7 @@ static atomic_bool s_connect_pending = ATOMIC_VAR_INIT(false);
 static atomic_bool s_sta_idle = ATOMIC_VAR_INIT(true);
 static int s_retry = 0;
 static int s_reconnect_backoff_ms = 1000;  // grows on consecutive failures
+static bool s_sntp_started = false;
 #define MAX_INITIAL_RETRY        3
 #define RECONNECT_BACKOFF_MIN_MS 1000
 #define RECONNECT_BACKOFF_MAX_MS 60000
@@ -148,6 +150,28 @@ static bool drop_rssi_floor(uint8_t reason) {
 }
 #endif
 
+static void sntp_synced(struct timeval *tv)
+{
+    (void)tv;
+    ESP_LOGI(TAG, "time synced");
+}
+
+/* Wall-clock time for TLS certificate validation (HTTPS APIs, OTA). Starts
+ * once; the client re-syncs on its own while Wi-Fi is up. */
+static void sntp_start_once(void)
+{
+    if (s_sntp_started) {
+        return;
+    }
+    s_sntp_started = true;
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    config.sync_cb = sntp_synced;
+    if (esp_netif_sntp_init(&config) != ESP_OK || esp_netif_sntp_start() != ESP_OK) {
+        ESP_LOGW(TAG, "time sync failed to start");
+        s_sntp_started = false;
+    }
+}
+
 static void event_handler(void *arg, esp_event_base_t base,
                           int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -191,6 +215,7 @@ static void event_handler(void *arg, esp_event_base_t base,
         s_keep_connected = true;
         s_reconnect_backoff_ms = RECONNECT_BACKOFF_MIN_MS;  // reset on success
         xEventGroupSetBits(s_events, BIT_CONNECTED | BIT_GOT_IP);
+        sntp_start_once();
     }
 }
 

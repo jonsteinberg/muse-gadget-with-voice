@@ -21,6 +21,7 @@
 # from idf_component.yml, where rules keep them out of Link-only builds.
 set(srcs)
 set(embed)
+set(embed_txt)
 if(CONFIG_MUSE_ENABLED)
     list(APPEND srcs
         "muse_app.c"
@@ -45,6 +46,9 @@ if(CONFIG_MUSE_ENABLED)
     if(CONFIG_MUSE_HATCH)
         list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp")
         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
+        if(CONFIG_MUSE_TTS_ELEVENLABS)
+            list(APPEND embed_txt "elevenlabs_roots.pem")   # TTS client's trust anchor
+        endif()
     else()
         list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
     endif()
@@ -122,6 +126,7 @@ idf_component_register(
     SRCS ${srcs}
     INCLUDE_DIRS "."
     EMBED_FILES ${embed}
+    EMBED_TXTFILES ${embed_txt}
     WHOLE_ARCHIVE   # muse_lv_mem.c provides symbols only LVGL references
     REQUIRES esp_driver_gpio esp_driver_i2c
     PRIV_REQUIRES ${muse_priv_requires}

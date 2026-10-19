@@ -56,6 +56,7 @@ static const char *TAG = "muse_ui";
 #define RING_RANGE 1000
 #define CAPTION_W 256           /* 16 columns of unscii_16, the width reply captions wrap to */
 #define CAPTION_LINE_SPACE 2
+#define SMALL_CAPTION_LINES 6   /* reply lines in the compact caption band */
 #define ART_BLANK_ROWS 3        /* Muse's art never reaches the grid's bottom rows */
 #define MINI_CELL_PX 2          /* Muse's grid cells over a reply that's read */
 #define ANSWER_MS 300           /* Muse making room for a reply, and back */
@@ -920,9 +921,10 @@ static void build_screen(void)
 
     s_caption_lbl = make_label(face, font_pick(caption_font(), &lv_font_unscii_8), COLOR_CAPTION);
     if (s_small) {
-        /* Two lines over the bottom of the face, on a dark band so they stay
+        /* Six lines over the bottom of the face, on a dark band so they stay
          * legible. A tall screen has room to keep them above the mic icon. */
-        lv_obj_set_size(s_caption_lbl, s_w, 2 * 8 + 2 + 4);
+        lv_obj_set_size(s_caption_lbl, s_w, SMALL_CAPTION_LINES * 8 +
+                        (SMALL_CAPTION_LINES - 1) * CAPTION_LINE_SPACE + 4);
         lv_obj_set_style_pad_ver(s_caption_lbl, 2, 0);
         lv_obj_set_style_text_line_space(s_caption_lbl, 2, 0);
         lv_obj_set_style_bg_color(s_caption_lbl, lv_color_black(), 0);
@@ -930,6 +932,9 @@ static void build_screen(void)
         lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
         /* Touch screens need the caption above the navigation dots too. */
         lv_obj_align(s_caption_lbl, LV_ALIGN_BOTTOM_MID, 0, (s_tall || s_tv) ? -30 : -3);
+        /* Wrap and page replies to the band. */
+        muse_state_set_page(s_w / lv_font_get_glyph_width(&lv_font_unscii_8, 'M', ' '),
+                            SMALL_CAPTION_LINES);
 #if CONFIG_MUSE_CJK_FONT
         /* CJK doesn't fit unscii-8's cell, so a reply with CJK in it fills the
          * band one line at a time in the 16 px caption font instead. */

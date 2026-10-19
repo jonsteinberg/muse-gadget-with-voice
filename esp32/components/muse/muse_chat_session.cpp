@@ -52,6 +52,7 @@
 #include "esp_attr.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -1501,6 +1502,117 @@ static void on_chat_ack(stream_t *s)
 
 /* ---- Turn: speech ---- */
 
+static void tts_data(const uint8_t *data, size_t len);
+
+#if CONFIG_MUSE_TTS_ELEVENLABS
+#define TTS_URL_FMT "https://api.elevenlabs.io/v1/text-to-speech/%s?output_format=mp3_44100_64"
+#define TTS_TIMEOUT_MS 20000
+#define TTS_ATTEMPTS 3
+
+/* Pinned trust anchor for api.elevenlabs.io: self-signed GTS Root R1
+ * (pki.goog, expires 2036). The default bundle has it too, but its lookup
+ * can't follow the server's cross-signed chain top, so pin it directly. */
+extern const char elevenlabs_roots_pem_start[] asm("_binary_elevenlabs_roots_pem_start");
+
+typedef struct {
+    uint8_t *buf;
+    size_t len;
+} tts_resp_t;
+
+static esp_err_t tts_on_http(esp_http_client_event_t *evt)
+{
+    tts_resp_t *r = static_cast<tts_resp_t *>(evt->user_data);
+    if (evt->event_id != HTTP_EVENT_ON_DATA || !evt->data || !evt->data_len) {
+        return ESP_OK;
+    }
+    size_t room = MP3_BUF - r->len;
+    size_t n = evt->data_len < room ? evt->data_len : room;
+    memcpy(r->buf + r->len, evt->data, n);
+    r->len += n;
+    return ESP_OK;
+}
+
+/* Speaks `text` through ElevenLabs, buffering the MP3 for decode(). True on
+ * HTTP 200 with audio; anything else falls back to silent captions. Runs on
+ * the chat task; decode() only starts once the message goes TTS_ACTIVE. */
+static bool tts_fetch(const char *text)
+{
+    const char *key = CONFIG_MUSE_TTS_API_KEY;
+    if (!key[0]) {
+        return false;
+    }
+    cJSON *body = cJSON_CreateObject();
+    if (!body) {
+        return false;
+    }
+    cJSON_AddStringToObject(body, "text", text);
+    cJSON_AddStringToObject(body, "model_id", CONFIG_MUSE_TTS_MODEL);
+    char *json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!json) {
+        return false;
+    }
+    char url[192];
+    snprintf(url, sizeof(url), TTS_URL_FMT, CONFIG_MUSE_TTS_VOICE);
+    uint8_t *mp3 = static_cast<uint8_t *>(heap_caps_malloc(MP3_BUF, MALLOC_CAP_SPIRAM));
+    if (!mp3) {
+        cJSON_free(json);
+        return false;
+    }
+    bool ok = false;
+    int backoff_ms = 1000;
+    for (int attempt = 1; attempt <= TTS_ATTEMPTS && !ok; attempt++) {
+        tts_resp_t r = { mp3, 0 };
+        esp_http_client_config_t cfg = {};
+        cfg.url = url;
+        cfg.method = HTTP_METHOD_POST;
+        cfg.timeout_ms = TTS_TIMEOUT_MS;
+        cfg.buffer_size = 4096;
+        cfg.buffer_size_tx = 4096;
+        cfg.event_handler = tts_on_http;
+        cfg.user_data = &r;
+        cfg.cert_pem = elevenlabs_roots_pem_start;
+        cfg.disable_auto_redirect = true;
+        esp_http_client_handle_t c = esp_http_client_init(&cfg);
+        int status = 0;
+        esp_err_t err = ESP_FAIL;
+        if (c) {
+            esp_http_client_set_header(c, "Content-Type", "application/json");
+            esp_http_client_set_header(c, "xi-api-key", key);
+            esp_http_client_set_post_field(c, json, (int)strlen(json));
+            err = esp_http_client_perform(c);
+            status = esp_http_client_get_status_code(c);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "elevenlabs: perform %s, transport errno %d",
+                         esp_err_to_name(err), esp_http_client_get_errno(c));
+            }
+            esp_http_client_cleanup(c);
+        }
+        if (status == 200 && r.len > 0) {
+            tts_data(mp3, r.len);
+            ESP_LOGI(TAG, "elevenlabs: HTTP 200, %u bytes (attempt %d)", (unsigned)r.len, attempt);
+            ok = true;
+        } else if (status == 401 || status == 403) {
+            ESP_LOGW(TAG, "elevenlabs: HTTP %d, check the API key", status);
+            break;
+        } else {
+            bool retryable = status <= 0 || status == 408 || status == 429 ||
+                             (status >= 500 && status < 600);
+            ESP_LOGW(TAG, "elevenlabs: %s, HTTP %d (attempt %d)",
+                     esp_err_to_name(err), status, attempt);
+            if (!retryable || attempt == TTS_ATTEMPTS) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+            backoff_ms *= 2;
+        }
+    }
+    heap_caps_free(mp3);
+    cJSON_free(json);
+    return ok;
+}
+#endif
+
 static void start_tts(void)
 {
     if (s_turn.tts_msg >= 0) {
@@ -1513,25 +1625,40 @@ static void start_tts(void)
         }
         /*
          * Replies are text, shown at reading pace: silence in place of speech
-         * paces the captions and ends the turn. To speak them instead, send
-         * the message's text (s_turn.texts + i * TEXT_MAX, if texts was
-         * allocated; up to TEXT_MAX - 1 bytes) to a TTS API of your choice and
-         * play the MP3 it returns. In place of the silence below: keep
-         * m.tts = TTS_ACTIVE and s_turn.tts_msg = i, set s_turn.silent = false,
-         * m.pcm_start = s_turn.pcm_out, m.pcm_frames = 0, s_turn.mp3_len = 0,
-         * s_turn.mp3_ended = false, s_turn.kbps = 0, s_turn.down_rate = 0 and
-         * mp3dec_init(&s_turn.dec). Then, on this task, pass the MP3 to
-         * tts_data() as it arrives (it buffers up to MP3_BUF and drops the
-         * rest, so hold off while it's full) and set s_turn.mp3_ended at the
-         * end. decode() plays it at the speaker's volume, captions following,
-         * and finishes the message once it's drained.
+         * paces the captions and ends the turn. With MUSE_TTS_ELEVENLABS the
+         * message's text goes to ElevenLabs instead and decode() plays the
+         * MP3 back at the speaker's volume, captions following.
          */
-        m.pcm_start = s_turn.pcm_out;
-        m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
-        m.tts = TTS_ACTIVE;
-        s_turn.tts_msg = i;
-        s_turn.silent = true;
-        ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
+        bool spoken = false;
+#if CONFIG_MUSE_TTS_ELEVENLABS
+        if (s_turn.texts && muse_settings_speaker_on()) {
+            const char *text = s_turn.texts + i * TEXT_MAX;
+            s_turn.mp3_len = 0;
+            if (text[0] && tts_fetch(text)) {
+                m.pcm_start = s_turn.pcm_out;
+                m.pcm_frames = 0;
+                m.tts = TTS_ACTIVE;
+                s_turn.tts_msg = i;
+                s_turn.silent = false;
+                s_turn.mp3_ended = true;
+                s_turn.kbps = 0;
+                s_turn.down_rate = 0;
+                mp3dec_init(&s_turn.dec);
+                ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
+                spoken = true;
+            } else {
+                s_turn.mp3_len = 0;
+            }
+        }
+#endif
+        if (!spoken) {
+            m.pcm_start = s_turn.pcm_out;
+            m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+            m.tts = TTS_ACTIVE;
+            s_turn.tts_msg = i;
+            s_turn.silent = true;
+            ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
+        }
         show_reply_start(m);
         return;
     }
